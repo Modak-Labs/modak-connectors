@@ -3,6 +3,7 @@ package io.modak.spark;
 import io.modak.connector.SeamClient;
 import io.modak.connector.SeamOptions;
 import io.modak.connector.SeamState;
+import io.modak.connector.TierKeySql;
 import io.modak.load.DeltaLoader;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -28,18 +29,22 @@ final class SeamWriter {
         SeamState state = SeamClient.capture(options, false);
 
         Column tierKey = rows.col(state.tierKeyCol());
-        Dataset<Row> cold = rows.filter(tierKey.lt(state.tierKeyHi()));
+        Column cutLine = TierKeyColumns.boundary(state.tierKeyType(), state.tierKeyHi());
+        Dataset<Row> cold = rows.filter(tierKey.lt(cutLine));
         Long line = state.retentionLine();
-        if (line != null && !cold.filter(tierKey.lt(line)).isEmpty()) {
+        if (line != null && !cold.filter(tierKey.lt(
+                TierKeyColumns.boundary(state.tierKeyType(), line))).isEmpty()) {
             throw new IllegalStateException("write to " + options.qualifiedName()
-                    + " contains rows below the retention line " + line
+                    + " contains rows below the retention line "
+                    + TierKeySql.literal(state.tierKeyType(), line)
                     + ", rows this old have been expired from the lake");
         }
 
-        append(rows.filter(tierKey.geq(state.tierKeyHi())), options);
+        append(rows.filter(tierKey.geq(cutLine)), options);
         Dataset<Row> encoded = cold.select(
                 PkColumns.expression(state.primaryKeyCols(), cold).as("pk"),
-                cold.col(state.tierKeyCol()).cast("long").as("tier_key"),
+                TierKeyColumns.canonical(cold.col(state.tierKeyCol()),
+                        state.tierKeyType()).as("tier_key"),
                 functions.to_json(functions.struct(functions.col("*"))).as("payload"));
         encoded.foreachPartition(new DeltaUpsert(
                 options.jdbcUrl(), options.jdbcProperties(), state.tableId()));

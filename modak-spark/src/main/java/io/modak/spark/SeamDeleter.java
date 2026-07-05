@@ -3,6 +3,7 @@ package io.modak.spark;
 import io.modak.connector.SeamClient;
 import io.modak.connector.SeamOptions;
 import io.modak.connector.SeamState;
+import io.modak.connector.TierKeySql;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -28,16 +29,19 @@ final class SeamDeleter {
         SeamState state = SeamClient.capture(options, false);
 
         Column tierKey = keys.col(state.tierKeyCol());
-        Dataset<Row> cold = keys.filter(tierKey.lt(state.tierKeyHi()));
+        Column cutLine = TierKeyColumns.boundary(state.tierKeyType(), state.tierKeyHi());
+        Dataset<Row> cold = keys.filter(tierKey.lt(cutLine));
         Long line = state.retentionLine();
-        if (line != null && !cold.filter(tierKey.lt(line)).isEmpty()) {
+        if (line != null && !cold.filter(tierKey.lt(
+                TierKeyColumns.boundary(state.tierKeyType(), line))).isEmpty()) {
             throw new IllegalStateException("delete on " + options.qualifiedName()
-                    + " targets rows below the retention line " + line
+                    + " targets rows below the retention line "
+                    + TierKeySql.literal(state.tierKeyType(), line)
                     + ", rows this old have been expired from the lake");
         }
 
         List<String> pkCols = state.primaryKeyCols();
-        Dataset<Row> hot = keys.filter(tierKey.geq(state.tierKeyHi()))
+        Dataset<Row> hot = keys.filter(tierKey.geq(cutLine))
                 .select(pkCols.stream()
                         .map(c -> keys.col(c).cast("string"))
                         .toArray(Column[]::new));
@@ -47,7 +51,8 @@ final class SeamDeleter {
         Column[] pkFields = pkCols.stream().map(cold::col).toArray(Column[]::new);
         Dataset<Row> encoded = cold.select(
                 PkColumns.expression(pkCols, cold).as("pk"),
-                cold.col(state.tierKeyCol()).cast("long").as("tier_key"),
+                TierKeyColumns.canonical(cold.col(state.tierKeyCol()),
+                        state.tierKeyType()).as("tier_key"),
                 functions.to_json(functions.struct(pkFields)).as("payload"));
         encoded.foreachPartition(new DeltaTombstone(
                 options.jdbcUrl(), options.jdbcProperties(), state.tableId()));

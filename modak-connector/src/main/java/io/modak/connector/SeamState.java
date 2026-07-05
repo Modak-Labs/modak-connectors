@@ -7,6 +7,7 @@ public record SeamState(
         long tableId,
         List<String> primaryKeyCols,
         String tierKeyCol,
+        String tierKeyType,
         String mode,
         String lakeFormat,
         String lakeTableRef,

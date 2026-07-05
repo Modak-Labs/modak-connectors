@@ -3,6 +3,7 @@ package io.modak.spark;
 import io.modak.connector.SeamClient;
 import io.modak.connector.SeamOptions;
 import io.modak.connector.SeamState;
+import io.modak.connector.TierKeySql;
 import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
@@ -49,14 +50,16 @@ public final class SeamRead implements AutoCloseable {
         }
 
         Dataset<Row> hot = jdbc("(SELECT * FROM " + options.qualifiedName()
-                + " WHERE " + state.tierKeyCol() + " >= " + state.readSeam() + ") modak_hot");
+                + " WHERE " + state.tierKeyCol() + " >= "
+                + TierKeySql.literal(state.tierKeyType(), state.readSeam()) + ") modak_hot");
         if (state.snapshotId() == null) {
             return hot;
         }
 
         Dataset<Row> cold = coldBranch();
         if (state.hybridSeam() != null) {
-            cold = cold.filter(cold.col(state.tierKeyCol()).lt(state.readSeam()));
+            cold = cold.filter(cold.col(state.tierKeyCol())
+                    .lt(TierKeyColumns.boundary(state.tierKeyType(), state.readSeam())));
         }
 
         Dataset<Row> delta = jdbc("(SELECT pk AS __modak_pk, op AS __modak_op,"

@@ -17,7 +17,7 @@ import java.util.List;
 public final class SeamClient {
 
     private static final String TABLE_SQL = """
-            SELECT t.table_id, t.primary_key_cols, t.tier_key_col, t.mode,
+            SELECT t.table_id, t.primary_key_cols, t.tier_key_col, t.tier_key_type, t.mode,
                    t.lake_format, t.lake_table_ref,
                    c.lake_props ->> 'metadata_location',
                    (c.lake_props ->> 'snapshot_id')::bigint,
@@ -130,6 +130,7 @@ public final class SeamClient {
         long tableId;
         List<String> pkCols;
         String tierKeyCol;
+        String tierKeyType;
         String mode;
         String lakeFormat;
         String lakeTableRef;
@@ -148,12 +149,13 @@ public final class SeamClient {
                 tableId = rs.getLong(1);
                 pkCols = textArray(rs.getArray(2));
                 tierKeyCol = rs.getString(3);
-                mode = rs.getString(4);
-                lakeFormat = rs.getString(5);
-                lakeTableRef = rs.getString(6);
-                metadataLocation = rs.getString(7);
-                snapshotId = (Long) rs.getObject(8);
-                heapRetentionLag = (Long) rs.getObject(9);
+                tierKeyType = rs.getString(4);
+                mode = rs.getString(5);
+                lakeFormat = rs.getString(6);
+                lakeTableRef = rs.getString(7);
+                metadataLocation = rs.getString(8);
+                snapshotId = (Long) rs.getObject(9);
+                heapRetentionLag = (Long) rs.getObject(10);
             }
         }
 
@@ -175,7 +177,7 @@ public final class SeamClient {
 
         Long hybridSeam = null;
         if (hybrid && snapshotId != null) {
-            hybridSeam = hybridSeam(c, options, tierKeyCol);
+            hybridSeam = hybridSeam(c, options, tierKeyCol, tierKeyType);
         }
 
         Long pinId = null;
@@ -193,15 +195,17 @@ public final class SeamClient {
             }
         }
 
-        return new SeamState(tableId, pkCols, tierKeyCol, mode, lakeFormat, lakeTableRef,
-                metadataLocation, snapshotId, heapRetentionLag, tierKeyHi, retentionLine,
-                hybridSeam, pinId);
+        return new SeamState(tableId, pkCols, tierKeyCol, tierKeyType, mode, lakeFormat,
+                lakeTableRef, metadataLocation, snapshotId, heapRetentionLag, tierKeyHi,
+                retentionLine, hybridSeam, pinId);
     }
 
-    private static Long hybridSeam(Connection c, SeamOptions options, String tierKeyCol)
-            throws SQLException {
-        String sql = "SELECT max(" + quoteIdent(tierKeyCol) + ") FROM "
-                + quoteIdent(options.schemaName()) + "." + quoteIdent(options.tableName());
+    private static Long hybridSeam(Connection c, SeamOptions options, String tierKeyCol,
+            String tierKeyType) throws SQLException {
+        String sql = "SELECT " + TierKeySql.canonicalExpr(tierKeyType,
+                        "max(" + quoteIdent(tierKeyCol) + ")")
+                + " FROM " + quoteIdent(options.schemaName())
+                + "." + quoteIdent(options.tableName());
         try (PreparedStatement ps = c.prepareStatement(sql);
                 ResultSet rs = ps.executeQuery()) {
             if (!rs.next()) {
