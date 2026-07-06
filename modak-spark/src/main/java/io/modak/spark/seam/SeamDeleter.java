@@ -1,9 +1,9 @@
-package io.modak.spark;
+package io.modak.spark.seam;
 
-import io.modak.connector.SeamClient;
-import io.modak.connector.SeamOptions;
-import io.modak.connector.SeamState;
-import io.modak.connector.TierKeySql;
+import io.modak.connector.seam.SeamClient;
+import io.modak.connector.seam.SeamOptions;
+import io.modak.connector.seam.SeamState;
+import io.modak.load.DeltaLoader;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -16,38 +16,22 @@ import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.functions;
 
-/**
- * Routed deletes: keys at or above the cut-line delete from the heap, keys
- * below it become {@code op = 1} tombstones for the worker to fold into the
- * lake, and keys below the retention line are rejected (expired from the lake).
- */
-final class SeamDeleter {
+public final class SeamDeleter {
 
     private SeamDeleter() {}
 
-    static void delete(Dataset<Row> keys, SeamOptions options) {
+    public static void delete(Dataset<Row> keys, SeamOptions options) {
         SeamState state = SeamClient.capture(options, false);
-
-        Column tierKey = keys.col(state.tierKeyCol());
-        Column cutLine = TierKeyColumns.boundary(state.tierKeyType(), state.tierKeyHi());
-        Dataset<Row> cold = keys.filter(tierKey.lt(cutLine));
-        Long line = state.retentionLine();
-        if (line != null && !cold.filter(tierKey.lt(
-                TierKeyColumns.boundary(state.tierKeyType(), line))).isEmpty()) {
-            throw new IllegalStateException("delete on " + options.qualifiedName()
-                    + " targets rows below the retention line "
-                    + TierKeySql.literal(state.tierKeyType(), line)
-                    + ", rows this old have been expired from the lake");
-        }
+        TierRouter.Routed routed = TierRouter.route(keys, options, state, "delete on", "targets");
 
         List<String> pkCols = state.primaryKeyCols();
-        Dataset<Row> hot = keys.filter(tierKey.geq(cutLine))
-                .select(pkCols.stream()
-                        .map(c -> keys.col(c).cast("string"))
-                        .toArray(Column[]::new));
+        Dataset<Row> hot = routed.hot().select(pkCols.stream()
+                .map(c -> keys.col(c).cast("string"))
+                .toArray(Column[]::new));
         hot.foreachPartition(new HotDelete(options.jdbcUrl(), options.jdbcProperties(),
                 options.schemaName(), options.tableName(), pkCols));
 
+        Dataset<Row> cold = routed.cold();
         Column[] pkFields = pkCols.stream().map(cold::col).toArray(Column[]::new);
         Dataset<Row> encoded = cold.select(
                 PkColumns.expression(pkCols, cold).as("pk"),
@@ -118,21 +102,6 @@ final class SeamDeleter {
 
     private static final class DeltaTombstone implements ForeachPartitionFunction<Row> {
 
-        private static final String SQL = """
-                INSERT INTO modak.delta (table_id, pk, op, tier_key, version, payload)
-                VALUES (?, ?, 1, ?, nextval('modak.delta_version'), ?::jsonb)
-                ON CONFLICT (table_id, pk) DO UPDATE
-                   SET op = 1, tier_key = excluded.tier_key,
-                       old_tier_key = nullif(
-                           coalesce(modak.delta.old_tier_key, modak.delta.tier_key),
-                           excluded.tier_key),
-                       version = excluded.version,
-                       payload = excluded.payload, updated_at = now()
-                 WHERE modak.delta.version < excluded.version
-                """;
-
-        private static final int BATCH = 500;
-
         private final String url;
         private final Properties properties;
         private final long tableId;
@@ -150,24 +119,19 @@ final class SeamDeleter {
             }
             try (Connection c = DriverManager.getConnection(url, properties)) {
                 c.setAutoCommit(false);
-                try (PreparedStatement ps = c.prepareStatement(SQL)) {
-                    int pending = 0;
-                    while (rows.hasNext()) {
+                DeltaLoader.upsert(c, tableId, new Iterator<>() {
+                    @Override
+                    public boolean hasNext() {
+                        return rows.hasNext();
+                    }
+
+                    @Override
+                    public DeltaLoader.Entry next() {
                         Row row = rows.next();
-                        ps.setLong(1, tableId);
-                        ps.setString(2, row.getString(0));
-                        ps.setLong(3, row.getLong(1));
-                        ps.setString(4, row.getString(2));
-                        ps.addBatch();
-                        if (++pending == BATCH) {
-                            ps.executeBatch();
-                            pending = 0;
-                        }
+                        return DeltaLoader.Entry.tombstone(
+                                row.getString(0), row.getLong(1), row.getString(2));
                     }
-                    if (pending > 0) {
-                        ps.executeBatch();
-                    }
-                }
+                });
                 c.commit();
             }
         }

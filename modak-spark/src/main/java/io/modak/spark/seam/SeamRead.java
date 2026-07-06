@@ -1,20 +1,16 @@
-package io.modak.spark;
+package io.modak.spark.seam;
 
-import io.modak.connector.SeamClient;
-import io.modak.connector.SeamOptions;
-import io.modak.connector.SeamState;
-import io.modak.connector.TierKeySql;
+import io.modak.connector.seam.SeamClient;
+import io.modak.connector.seam.SeamOptions;
+import io.modak.connector.seam.SeamState;
+import io.modak.connector.seam.TierKeySql;
 import org.apache.spark.sql.Column;
+import org.apache.spark.sql.DataFrameReader;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.functions;
 
-/**
- * One pinned two-tier read: the heap over JDBC, the lake at the pinned
- * snapshot, and the delta overlay merged newest-wins, unioned into one
- * dataframe.
- */
 public final class SeamRead implements AutoCloseable {
 
     private final SparkSession spark;
@@ -23,7 +19,7 @@ public final class SeamRead implements AutoCloseable {
     private Dataset<Row> dataframe;
     private boolean closed;
 
-    SeamRead(SparkSession spark, SeamOptions options, SeamState state) {
+    public SeamRead(SparkSession spark, SeamOptions options, SeamState state) {
         this.spark = spark;
         this.options = options;
         this.state = state;
@@ -83,14 +79,20 @@ public final class SeamRead implements AutoCloseable {
             throw new UnsupportedOperationException("modak-spark cannot read lake format '"
                     + state.lakeFormat() + "' yet (supported: iceberg)");
         }
-        return spark.read()
+        String ref = options.lakeTable() != null ? options.lakeTable() : state.lakeTableRef();
+        DataFrameReader reader = spark.read()
                 .format("iceberg")
-                .option("snapshot-id", state.snapshotId())
-                .load(options.lakeTable() != null ? options.lakeTable()
-                        : state.lakeTableRef());
+                .option("snapshot-id", state.snapshotId());
+        return isPath(ref) ? reader.load(ref) : reader.table(ref);
+    }
+
+    private static boolean isPath(String ref) {
+        return ref.contains("://") || ref.startsWith("/");
     }
 
     private Dataset<Row> jdbc(String table) {
-        return spark.read().jdbc(options.jdbcUrl(), table, options.jdbcProperties());
+        java.util.Properties props = (java.util.Properties) options.jdbcProperties().clone();
+        props.putIfAbsent("driver", "org.postgresql.Driver");
+        return spark.read().jdbc(options.jdbcUrl(), table, props);
     }
 }

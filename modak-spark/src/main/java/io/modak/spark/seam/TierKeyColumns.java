@@ -1,13 +1,12 @@
-package io.modak.spark;
+package io.modak.spark.seam;
 
-import io.modak.connector.TierKeySql;
+import io.modak.connector.seam.TierKeySql;
 import java.sql.Timestamp;
 import java.time.LocalDate;
 import java.util.Locale;
 import org.apache.spark.sql.Column;
 import org.apache.spark.sql.functions;
 
-/** Native-typed Spark expressions for canonical i64 tier keys. */
 final class TierKeyColumns {
 
     private TierKeyColumns() {}

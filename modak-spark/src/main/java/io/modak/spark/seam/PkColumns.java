@@ -1,4 +1,4 @@
-package io.modak.spark;
+package io.modak.spark.seam;
 
 import io.modak.common.PkCodec;
 import java.util.ArrayList;
@@ -11,11 +11,6 @@ import org.apache.spark.sql.expressions.UserDefinedFunction;
 import org.apache.spark.sql.functions;
 import org.apache.spark.sql.types.DataTypes;
 
-/**
- * The canonical pk text encoding as a Spark column, matching {@link PkCodec}
- * byte for byte. Single-column keys are a plain string cast, composite keys
- * go through a UDF over the codec.
- */
 final class PkColumns {
 
     private PkColumns() {}

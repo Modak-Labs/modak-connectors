@@ -1,4 +1,4 @@
-package io.modak.connector;
+package io.modak.connector.seam;
 
 import java.time.Instant;
 import java.time.LocalDate;

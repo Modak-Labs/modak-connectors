@@ -1,4 +1,4 @@
-package io.modak.connector;
+package io.modak.connector.seam;
 
 import java.sql.Array;
 import java.sql.Connection;

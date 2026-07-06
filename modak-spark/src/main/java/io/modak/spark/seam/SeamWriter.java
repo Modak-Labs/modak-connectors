@@ -1,46 +1,29 @@
-package io.modak.spark;
+package io.modak.spark.seam;
 
-import io.modak.connector.SeamClient;
-import io.modak.connector.SeamOptions;
-import io.modak.connector.SeamState;
-import io.modak.connector.TierKeySql;
+import io.modak.connector.seam.SeamClient;
+import io.modak.connector.seam.SeamOptions;
+import io.modak.connector.seam.SeamState;
 import io.modak.load.DeltaLoader;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.util.Iterator;
 import java.util.Properties;
 import org.apache.spark.api.java.function.ForeachPartitionFunction;
-import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SaveMode;
 import org.apache.spark.sql.functions;
 
-/**
- * Routed inserts: rows at or above the cut-line go to the heap, rows
- * below it become {@code op = 0} delta rows, and rows below the
- * retention line are rejected.
- */
-final class SeamWriter {
+public final class SeamWriter {
 
     private SeamWriter() {}
 
-    static void write(Dataset<Row> rows, SeamOptions options) {
+    public static void write(Dataset<Row> rows, SeamOptions options) {
         SeamState state = SeamClient.capture(options, false);
+        TierRouter.Routed routed = TierRouter.route(rows, options, state, "write to", "contains");
 
-        Column tierKey = rows.col(state.tierKeyCol());
-        Column cutLine = TierKeyColumns.boundary(state.tierKeyType(), state.tierKeyHi());
-        Dataset<Row> cold = rows.filter(tierKey.lt(cutLine));
-        Long line = state.retentionLine();
-        if (line != null && !cold.filter(tierKey.lt(
-                TierKeyColumns.boundary(state.tierKeyType(), line))).isEmpty()) {
-            throw new IllegalStateException("write to " + options.qualifiedName()
-                    + " contains rows below the retention line "
-                    + TierKeySql.literal(state.tierKeyType(), line)
-                    + ", rows this old have been expired from the lake");
-        }
-
-        append(rows.filter(tierKey.geq(cutLine)), options);
+        append(routed.hot(), options);
+        Dataset<Row> cold = routed.cold();
         Dataset<Row> encoded = cold.select(
                 PkColumns.expression(state.primaryKeyCols(), cold).as("pk"),
                 TierKeyColumns.canonical(cold.col(state.tierKeyCol()),
@@ -55,7 +38,6 @@ final class SeamWriter {
                 .jdbc(options.jdbcUrl(), options.qualifiedName(), options.jdbcProperties());
     }
 
-    /** Per-partition bridge into {@link DeltaLoader}, the shared delta upsert. */
     private static final class DeltaUpsert implements ForeachPartitionFunction<Row> {
 
         private final String url;
@@ -84,7 +66,7 @@ final class SeamWriter {
                     @Override
                     public DeltaLoader.Entry next() {
                         Row row = rows.next();
-                        return new DeltaLoader.Entry(
+                        return DeltaLoader.Entry.upsert(
                                 row.getString(0), row.getLong(1), row.getString(2));
                     }
                 });

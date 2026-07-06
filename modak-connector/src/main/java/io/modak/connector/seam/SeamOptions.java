@@ -1,4 +1,4 @@
-package io.modak.connector;
+package io.modak.connector.seam;
 
 import java.time.Duration;
 import java.util.Objects;

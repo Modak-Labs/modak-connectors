@@ -1,15 +1,14 @@
 package io.modak.spark;
 
-import io.modak.connector.SeamClient;
-import io.modak.connector.SeamOptions;
+import io.modak.connector.seam.SeamClient;
+import io.modak.connector.seam.SeamOptions;
+import io.modak.spark.seam.SeamDeleter;
+import io.modak.spark.seam.SeamRead;
+import io.modak.spark.seam.SeamWriter;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 
-/**
- * Spark consumer of the Modak seam protocol (docs/reference/seam.md): pinned
- * two-tier reads and tier-routed writes over a Modak table.
- */
 public final class ModakSpark {
 
     private ModakSpark() {}
