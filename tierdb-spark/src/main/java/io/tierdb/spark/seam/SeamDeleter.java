@@ -1,12 +1,17 @@
 package io.tierdb.spark.seam;
 
+import io.tierdb.common.mode.DeletePlan;
+import io.tierdb.common.mode.RouteTarget;
 import io.tierdb.connector.seam.SeamClient;
 import io.tierdb.connector.seam.SeamOptions;
 import io.tierdb.connector.seam.SeamState;
+import io.tierdb.connector.seam.TierKeySql;
 import io.tierdb.load.DeltaLoader;
+import io.tierdb.spark.lake.LakeMergeJob;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
+import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Properties;
@@ -23,23 +28,62 @@ public final class SeamDeleter {
     public static void delete(Dataset<Row> keys, SeamOptions options) {
         SeamState state = SeamClient.capture(options, false);
         TierRouter.Routed routed = TierRouter.route(keys, options, state, "delete on", "targets");
+        DeletePlan hotPlan = state.mode().planDelete(RouteTarget.HOT);
+        DeletePlan coldPlan = state.mode().planDelete(RouteTarget.COLD);
 
-        List<String> pkCols = state.primaryKeyCols();
-        Dataset<Row> hot = routed.hot().select(pkCols.stream()
+        List<String> pkCols = state.table().primaryKeyCols();
+        heapDelete(routed.hot(), keys, state, options,
+                hotPlan.heapFloor() ? tierFloor(state) : null);
+        Dataset<Row> cold = routed.cold();
+        if (coldPlan.fromHeap()) {
+            heapDelete(cold, keys, state, options, null);
+        }
+        coldPlan.cold().ifPresent(sink -> {
+            switch (sink) {
+                case LAKE -> {
+                    List<String> keyCols = new ArrayList<>(pkCols);
+                    if (!keyCols.contains(state.table().tierKeyCol())) {
+                        keyCols.add(state.table().tierKeyCol());
+                    }
+                    LakeMergeJob.deletes(
+                            cold.select(keyCols.stream().map(cold::col).toArray(Column[]::new)),
+                            state, options);
+                }
+                case DELTA -> deltaTombstone(cold, state, options);
+            }
+        });
+    }
+
+    private static void heapDelete(Dataset<Row> leg, Dataset<Row> keys, SeamState state,
+            SeamOptions options, String floor) {
+        List<String> pkCols = state.table().primaryKeyCols();
+        Dataset<Row> encoded = leg.select(pkCols.stream()
                 .map(c -> keys.col(c).cast("string"))
                 .toArray(Column[]::new));
-        hot.foreachPartition(new HotDelete(options.jdbcUrl(), options.jdbcProperties(),
-                options.schemaName(), options.tableName(), pkCols));
+        encoded.foreachPartition(new HotDelete(options.jdbcUrl(), options.jdbcProperties(),
+                options.schemaName(), options.tableName(), pkCols, floor));
+    }
 
-        Dataset<Row> cold = routed.cold();
+    /** A tier floor keeps a concurrent tier move from letting a hot delete touch a row gone cold. */
+    private static String tierFloor(SeamState state) {
+        return ident(state.table().tierKeyCol()) + " >= " + TierKeySql.literal(
+                state.table().tierKeyType(), state.cutLine().tierKeyHi());
+    }
+
+    private static String ident(String name) {
+        return "\"" + name.replace("\"", "\"\"") + "\"";
+    }
+
+    private static void deltaTombstone(Dataset<Row> cold, SeamState state, SeamOptions options) {
+        List<String> pkCols = state.table().primaryKeyCols();
         Column[] pkFields = pkCols.stream().map(cold::col).toArray(Column[]::new);
         Dataset<Row> encoded = cold.select(
                 PkColumns.expression(pkCols, cold).as("pk"),
-                TierKeyColumns.canonical(cold.col(state.tierKeyCol()),
-                        state.tierKeyType()).as("tier_key"),
+                TierKeyColumns.canonical(cold.col(state.table().tierKeyCol()),
+                        state.table().tierKeyType()).as("tier_key"),
                 functions.to_json(functions.struct(pkFields)).as("payload"));
         encoded.foreachPartition(new DeltaTombstone(
-                options.jdbcUrl(), options.jdbcProperties(), state.tableId()));
+                options.jdbcUrl(), options.jdbcProperties(), state.table().tableId()));
     }
 
     private static final class HotDelete implements ForeachPartitionFunction<Row> {
@@ -52,7 +96,7 @@ public final class SeamDeleter {
         private final int pkCount;
 
         HotDelete(String url, Properties properties, String schema, String table,
-                List<String> pkCols) {
+                List<String> pkCols, String floor) {
             this.url = url;
             this.properties = properties;
             this.pkCount = pkCols.size();
@@ -62,6 +106,9 @@ public final class SeamDeleter {
                     where.append(" AND ");
                 }
                 where.append(ident(pkCols.get(i))).append("::text = ?");
+            }
+            if (floor != null) {
+                where.append(" AND ").append(floor);
             }
             this.sql = "DELETE FROM " + ident(schema) + "." + ident(table)
                     + " WHERE " + where;

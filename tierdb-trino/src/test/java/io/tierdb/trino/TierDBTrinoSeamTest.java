@@ -227,6 +227,61 @@ class TierDBTrinoSeamTest {
         assertTrue(e.getMessage().contains("not supported"), e.getMessage());
     }
 
+    @Test
+    @Order(7)
+    void directTablesReadTheLiveLakeWithoutTheDelta() throws Exception {
+        exec("CREATE TABLE public.metrics (id bigint NOT NULL, event_time bigint NOT NULL, val text)");
+        exec("INSERT INTO public.metrics VALUES (1, 150, 'd-hot')");
+
+        org.apache.iceberg.Schema schema = new org.apache.iceberg.Schema(
+                org.apache.iceberg.types.Types.NestedField.required(1, "id",
+                        org.apache.iceberg.types.Types.LongType.get()),
+                org.apache.iceberg.types.Types.NestedField.required(2, "event_time",
+                        org.apache.iceberg.types.Types.LongType.get()),
+                org.apache.iceberg.types.Types.NestedField.optional(3, "val",
+                        org.apache.iceberg.types.Types.StringType.get()));
+        String directLocation = warehouse.resolve("metrics_direct").toString();
+        Table iceberg = new HadoopTables(new Configuration())
+                .create(schema, org.apache.iceberg.PartitionSpec.unpartitioned(), directLocation);
+
+        TableId direct = catalog.register(new TableRegistration(
+                relOid("public.metrics"), "public", "metrics", List.of("id"), "event_time",
+                "{\"unit\":\"range-100\"}", IcebergLakeStoragePlugin.IDENTIFIER, directLocation,
+                TableMode.DIRECT, null, null, Optional.empty(), Optional.empty()));
+        catalog.initCutline(direct, new TierKey(100), new LakeSnapshotId(0));
+
+        assertEquals(List.of("1|150|d-hot"),
+                rows("SELECT id, event_time, val FROM metrics"),
+                "an empty lake reads hot-only");
+
+        appendDirect(iceberg, 2L, 50L, "d-cold");
+        assertEquals(List.of("1|150|d-hot", "2|50|d-cold"),
+                rows("SELECT id, event_time, val FROM metrics"),
+                "the lake commit is immediately visible without a cutline publish");
+
+        exec("INSERT INTO tierdb.delta (table_id, pk, op, tier_key, version, payload) VALUES ("
+                + direct.oid() + ", '2', 1, 50, nextval('tierdb.delta_version'), NULL)");
+        assertEquals(List.of("1|150|d-hot", "2|50|d-cold"),
+                rows("SELECT id, event_time, val FROM metrics"),
+                "the delta overlay is never merged for direct tables");
+    }
+
+    private static void appendDirect(Table iceberg, long id, long eventTime, String val)
+            throws Exception {
+        GenericRecord row = GenericRecord.create(iceberg.schema());
+        row.setField("id", id);
+        row.setField("event_time", eventTime);
+        row.setField("val", val);
+        GenericAppenderFactory appenders = new GenericAppenderFactory(iceberg.schema());
+        DataWriter<Record> writer = appenders.newDataWriter(
+                EncryptedFiles.plainAsEncryptedOutput(iceberg.io().newOutputFile(
+                        iceberg.location() + "/data/direct-" + id + ".parquet")),
+                FileFormat.PARQUET, null);
+        writer.write(row);
+        writer.close();
+        iceberg.newAppend().appendFile(writer.toDataFile()).commit();
+    }
+
     private static List<String> rows(String sql) {
         MaterializedResult result = runner.execute(sql);
         return result.getMaterializedRows().stream()

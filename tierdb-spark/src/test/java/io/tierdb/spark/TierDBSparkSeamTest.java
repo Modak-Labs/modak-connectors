@@ -354,6 +354,98 @@ class TierDBSparkSeamTest {
                 + table.oid() + " AND pk = '1'"), "no tombstone written for the expired key");
     }
 
+    @Test
+    @Order(11)
+    void directTablesCommitColdWritesStraightToTheLake() {
+        exec("CREATE TABLE public.metrics (id bigint NOT NULL, event_time bigint NOT NULL, val text)");
+
+        org.apache.iceberg.Schema schema = new org.apache.iceberg.Schema(
+                org.apache.iceberg.types.Types.NestedField.required(1, "id",
+                        org.apache.iceberg.types.Types.LongType.get()),
+                org.apache.iceberg.types.Types.NestedField.required(2, "event_time",
+                        org.apache.iceberg.types.Types.LongType.get()),
+                org.apache.iceberg.types.Types.NestedField.optional(3, "val",
+                        org.apache.iceberg.types.Types.StringType.get()));
+        String directLocation = warehouse.resolve("metrics_direct").toString();
+        new org.apache.iceberg.hadoop.HadoopTables(new org.apache.hadoop.conf.Configuration())
+                .create(schema, org.apache.iceberg.PartitionSpec.unpartitioned(), directLocation);
+
+        TableId direct = catalog.register(new TableRegistration(
+                relOid("public.metrics"), "public", "metrics", List.of("id"), "event_time",
+                "{\"unit\":\"range-100\"}", IcebergLakeStoragePlugin.IDENTIFIER, directLocation,
+                TableMode.DIRECT, null, null, Optional.empty(), Optional.empty()));
+        catalog.initCutline(direct, new TierKey(100), new LakeSnapshotId(0));
+
+        SeamOptions directOptions = SeamOptions.builder()
+                .jdbcUrl(postgres.getJdbcUrl("postgres", "postgres"))
+                .table("public.metrics")
+                .build();
+
+        TierDBSpark.write(spark.createDataFrame(List.of(
+                RowFactory.create(1L, 150L, "d-hot"),
+                RowFactory.create(2L, 50L, "d-cold")), eventsSchema()), directOptions);
+
+        assertEquals("1", queryOne("SELECT count(*)::text FROM public.metrics WHERE id = 1"));
+        assertEquals("0", queryOne("SELECT count(*)::text FROM public.metrics WHERE id = 2"),
+                "the cold row must not land in the heap");
+        assertEquals("0", queryOne("SELECT count(*)::text FROM tierdb.delta WHERE table_id = "
+                + direct.oid()), "direct tables never buffer in the delta");
+
+        try (SeamRead read = TierDBSpark.read(spark, directOptions)) {
+            assertEquals(List.of("1|150|d-hot", "2|50|d-cold"), rows(read.dataframe()),
+                    "the lake commit is immediately visible (live read)");
+        }
+
+        TierDBSpark.write(spark.createDataFrame(
+                List.of(RowFactory.create(2L, 50L, "d-cold2")), eventsSchema()), directOptions);
+        try (SeamRead read = TierDBSpark.read(spark, directOptions)) {
+            assertEquals(List.of("1|150|d-hot", "2|50|d-cold2"), rows(read.dataframe()),
+                    "a cold upsert replaces the previous lake image");
+        }
+
+        TierDBSpark.delete(spark.createDataFrame(
+                List.of(RowFactory.create(2L, 50L, null)), eventsSchema()), directOptions);
+        assertEquals("0", queryOne("SELECT count(*)::text FROM tierdb.delta WHERE table_id = "
+                + direct.oid()), "the delete goes to the lake, not the delta");
+        try (SeamRead read = TierDBSpark.read(spark, directOptions)) {
+            assertEquals(List.of("1|150|d-hot"), rows(read.dataframe()));
+        }
+    }
+
+    @Test
+    @Order(12)
+    void keepHeapTablesWriteAndDeleteTheColdLegOnBothTiers() {
+        exec("CREATE TABLE public.audit (id bigint NOT NULL, event_time bigint NOT NULL, val text)");
+        TableId keep = catalog.register(new TableRegistration(
+                relOid("public.audit"), "public", "audit", List.of("id"), "event_time",
+                "{\"unit\":\"range-100\"}", IcebergLakeStoragePlugin.IDENTIFIER,
+                warehouse.resolve("audit_cold").toString(),
+                TableMode.TIERED, null, null, Optional.empty(), Optional.empty(), true));
+        catalog.initCutline(keep, new TierKey(100), new LakeSnapshotId(0));
+
+        SeamOptions keepOptions = SeamOptions.builder()
+                .jdbcUrl(postgres.getJdbcUrl("postgres", "postgres"))
+                .table("public.audit")
+                .build();
+
+        TierDBSpark.write(spark.createDataFrame(List.of(
+                RowFactory.create(1L, 150L, "k-hot"),
+                RowFactory.create(2L, 50L, "k-cold")), eventsSchema()), keepOptions);
+
+        assertEquals("2", queryOne("SELECT count(*)::text FROM public.audit"),
+                "keep-heap holds the cold row on the heap too");
+        assertEquals("0|k-cold", queryOne("SELECT op || '|' || (payload ->> 'val')"
+                + " FROM tierdb.delta WHERE table_id = " + keep.oid() + " AND pk = '2'"));
+
+        TierDBSpark.delete(spark.createDataFrame(
+                List.of(RowFactory.create(2L, 50L, null)), eventsSchema()), keepOptions);
+
+        assertEquals("0", queryOne("SELECT count(*)::text FROM public.audit WHERE id = 2"),
+                "the cold delete removes the heap copy");
+        assertEquals("1|2", queryOne("SELECT op || '|' || (payload ->> 'id')"
+                + " FROM tierdb.delta WHERE table_id = " + keep.oid() + " AND pk = '2'"));
+    }
+
     private static StructType eventsSchema() {
         return new StructType()
                 .add("id", DataTypes.LongType, false)

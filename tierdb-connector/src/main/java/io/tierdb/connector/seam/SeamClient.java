@@ -1,5 +1,8 @@
 package io.tierdb.connector.seam;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.tierdb.common.mode.Mode;
 import java.sql.Array;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -7,7 +10,10 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * The JDBC half of the seam protocol: captures the seam state, atomically
@@ -19,13 +25,16 @@ public final class SeamClient {
     private static final String TABLE_SQL = """
             SELECT t.table_id, t.primary_key_cols, t.tier_key_col, t.tier_key_type, t.mode,
                    t.lake_format, t.lake_table_ref,
-                   c.lake_props ->> 'metadata_location',
-                   (c.lake_props ->> 'snapshot_id')::bigint,
-                   t.heap_retention_lag
+                   c.lake_props::text,
+                   t.keep_heap, t.heap_retention_lag,
+                   sp.warehouse, sp.lake_config::text
               FROM tierdb.tables t
               LEFT JOIN tierdb.cutline c USING (table_id)
+              LEFT JOIN tierdb.storage_profiles sp ON sp.profile_name = t.storage_profile
              WHERE t.schema_name = ? AND t.table_name = ?
             """;
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private static final String CUTLINE_SQL =
             "SELECT tier_key_hi, retention_line, lake_snapshot_id"
@@ -131,12 +140,12 @@ public final class SeamClient {
         List<String> pkCols;
         String tierKeyCol;
         String tierKeyType;
-        String mode;
+        Mode mode;
         String lakeFormat;
         String lakeTableRef;
-        String metadataLocation;
-        Long snapshotId;
-        Long heapRetentionLag;
+        Map<String, String> lakeProps;
+        String warehouse;
+        Map<String, String> lakeConfig;
 
         try (PreparedStatement ps = c.prepareStatement(TABLE_SQL)) {
             ps.setString(1, options.schemaName());
@@ -150,18 +159,22 @@ public final class SeamClient {
                 pkCols = textArray(rs.getArray(2));
                 tierKeyCol = rs.getString(3);
                 tierKeyType = rs.getString(4);
-                mode = rs.getString(5);
+                String modeName = rs.getString(5);
                 lakeFormat = rs.getString(6);
                 lakeTableRef = rs.getString(7);
-                metadataLocation = rs.getString(8);
-                snapshotId = (Long) rs.getObject(9);
-                heapRetentionLag = (Long) rs.getObject(10);
+                lakeProps = parseConfig(rs.getString(8));
+                boolean keepHeap = rs.getBoolean(9);
+                Long heapRetentionLag = (Long) rs.getObject(10);
+                warehouse = rs.getString(11);
+                lakeConfig = parseConfig(rs.getString(12));
+                mode = Mode.fromCatalog(modeName, keepHeap, heapRetentionLag);
             }
         }
 
         long tierKeyHi;
         Long retentionLine;
         long cutlineSnapshot;
+        boolean hasLakeSnapshot;
         try (PreparedStatement ps = c.prepareStatement(CUTLINE_SQL)) {
             ps.setLong(1, tableId);
             try (ResultSet rs = ps.executeQuery()) {
@@ -171,12 +184,13 @@ public final class SeamClient {
                 }
                 tierKeyHi = rs.getLong(1);
                 retentionLine = (Long) rs.getObject(2);
+                hasLakeSnapshot = rs.getObject(3) != null;
                 cutlineSnapshot = rs.getLong(3);
             }
         }
 
         Long hybridSeam = null;
-        if (hybrid && snapshotId != null) {
+        if (hybrid && hasLakeSnapshot) {
             hybridSeam = hybridSeam(c, options, tierKeyCol, tierKeyType);
         }
 
@@ -195,9 +209,28 @@ public final class SeamClient {
             }
         }
 
-        return new SeamState(tableId, pkCols, tierKeyCol, tierKeyType, mode, lakeFormat,
-                lakeTableRef, metadataLocation, snapshotId, heapRetentionLag, tierKeyHi,
-                retentionLine, hybridSeam, pinId);
+        TableSeam tableSeam = new TableSeam(tableId, pkCols, tierKeyCol, tierKeyType, mode);
+        LakeProfile lake = new LakeProfile(lakeFormat, lakeTableRef, warehouse, lakeConfig);
+        CutLine cut = new CutLine(tierKeyHi, retentionLine, hybridSeam, lakeProps);
+        return new SeamState(tableSeam, lake, cut, pinId);
+    }
+
+    private static Map<String, String> parseConfig(String json) {
+        Map<String, String> out = new LinkedHashMap<>();
+        if (json == null || json.isBlank()) {
+            return out;
+        }
+        try {
+            JsonNode node = MAPPER.readTree(json);
+            for (Iterator<String> it = node.fieldNames(); it.hasNext();) {
+                String key = it.next();
+                JsonNode value = node.get(key);
+                out.put(key, value.isTextual() ? value.textValue() : value.toString());
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("captured seam column is not a valid JSON object", e);
+        }
+        return out;
     }
 
     private static Long hybridSeam(Connection c, SeamOptions options, String tierKeyCol,

@@ -3,10 +3,10 @@ package io.tierdb.trino.predicate;
 import io.airlift.slice.Slice;
 import io.tierdb.common.RowBatchData.Column;
 import io.tierdb.common.RowBatchData.ColumnType;
-import io.tierdb.connector.predicate.ColumnConstraint;
-import io.tierdb.connector.predicate.ColumnConstraint.OnlyNull;
-import io.tierdb.connector.predicate.ColumnConstraint.Ranges;
-import io.tierdb.connector.predicate.ColumnConstraint.ValueRange;
+import io.tierdb.lake.access.ColumnConstraint;
+import io.tierdb.lake.access.ColumnConstraint.OnlyNull;
+import io.tierdb.lake.access.ColumnConstraint.Ranges;
+import io.tierdb.lake.access.ColumnConstraint.ValueRange;
 import io.tierdb.trino.TierDBColumnHandle;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.predicate.Domain;
@@ -21,7 +21,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
-final class ConstraintAdapter {
+public final class ConstraintAdapter {
 
     private static final Set<ColumnType> PUSHABLE = EnumSet.of(
             ColumnType.BOOLEAN, ColumnType.LONG, ColumnType.DOUBLE,
@@ -29,7 +29,7 @@ final class ConstraintAdapter {
 
     private ConstraintAdapter() {}
 
-    static Map<Column, ColumnConstraint> from(TupleDomain<ColumnHandle> constraint) {
+    public static Map<Column, ColumnConstraint> from(TupleDomain<ColumnHandle> constraint) {
         Map<ColumnHandle, Domain> domains = constraint.getDomains().orElse(Map.of());
         Map<Column, ColumnConstraint> constraints = new LinkedHashMap<>();
         for (Map.Entry<ColumnHandle, Domain> entry : domains.entrySet()) {

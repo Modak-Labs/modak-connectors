@@ -4,9 +4,12 @@ import io.tierdb.common.RowBatchData.Column;
 import io.tierdb.common.RowBatchData.ColumnType;
 import io.tierdb.connector.ConnectorConfig;
 import io.tierdb.connector.source.LakeRowSource;
+import io.tierdb.lake.access.LakeAccess;
+import io.tierdb.lake.access.LakeAccessPlugin;
+import io.tierdb.lake.access.LakeScan;
 import io.tierdb.trino.TierDBColumnHandle;
 import io.tierdb.trino.TierDBTableHandle;
-import io.tierdb.trino.predicate.IcebergFilters;
+import io.tierdb.trino.predicate.ConstraintAdapter;
 import io.trino.spi.TrinoException;
 import java.util.Iterator;
 import java.util.List;
@@ -33,11 +36,11 @@ public class ColdPageSource extends RowPageSource {
                 .map(c -> new Column(c.name(), ColumnType.valueOf(c.kind())))
                 .toList();
         try {
+            LakeAccess access = LakeAccessPlugin.load(handle.lakeFormat(), handle.lakeConfig());
             rowSource = LakeRowSource.open(config.jdbcUrl(), config.jdbcProperties(),
-                    handle.tableId(), handle.metadataLocation(), handle.snapshotId(),
-                    handle.schemaName() + "." + handle.tableName(), lakeColumns,
-                    handle.primaryKeyCols(), config.fileIoProperties(),
-                    IcebergFilters.expression(handle.constraint()));
+                    handle.tableId(), access, new LakeScan(handle.scanProps()),
+                    handle.mergeDelta(), lakeColumns, handle.primaryKeyCols(),
+                    ConstraintAdapter.from(handle.constraint()));
         } catch (IllegalStateException e) {
             throw new TrinoException(GENERIC_INTERNAL_ERROR, "cold scan failed for " + handle, e);
         }

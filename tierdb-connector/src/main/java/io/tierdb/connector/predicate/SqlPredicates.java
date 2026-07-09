@@ -1,6 +1,9 @@
 package io.tierdb.connector.predicate;
 
 import io.tierdb.common.RowBatchData.Column;
+import io.tierdb.lake.access.ColumnConstraint;
+import io.tierdb.lake.access.ConstraintRenderer;
+import io.tierdb.lake.access.PredicateRenderer;
 import java.time.LocalDate;
 import java.util.Map;
 import java.util.Optional;

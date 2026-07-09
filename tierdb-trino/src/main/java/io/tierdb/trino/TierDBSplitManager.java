@@ -21,9 +21,11 @@ public class TierDBSplitManager implements ConnectorSplitManager {
         TierDBTableHandle handle = (TierDBTableHandle) table;
         List<ConnectorSplit> splits = new ArrayList<>();
         splits.add(new TierDBSplit(TierDBSplit.Kind.HOT));
-        if (!handle.heapComplete() && handle.snapshotId() != null) {
+        if (!handle.heapComplete() && handle.hasColdScan()) {
             splits.add(new TierDBSplit(TierDBSplit.Kind.COLD));
-            splits.add(new TierDBSplit(TierDBSplit.Kind.DELTA_UPSERTS));
+            if (handle.mergeDelta()) {
+                splits.add(new TierDBSplit(TierDBSplit.Kind.DELTA_UPSERTS));
+            }
         }
         return new FixedSplitSource(splits);
     }

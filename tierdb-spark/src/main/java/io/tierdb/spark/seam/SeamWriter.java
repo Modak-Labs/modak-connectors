@@ -1,9 +1,12 @@
 package io.tierdb.spark.seam;
 
+import io.tierdb.common.mode.InsertPlan;
+import io.tierdb.common.mode.RouteTarget;
 import io.tierdb.connector.seam.SeamClient;
 import io.tierdb.connector.seam.SeamOptions;
 import io.tierdb.connector.seam.SeamState;
 import io.tierdb.load.DeltaLoader;
+import io.tierdb.spark.lake.LakeMergeJob;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.util.Iterator;
@@ -21,16 +24,29 @@ public final class SeamWriter {
     public static void write(Dataset<Row> rows, SeamOptions options) {
         SeamState state = SeamClient.capture(options, false);
         TierRouter.Routed routed = TierRouter.route(rows, options, state, "write to", "contains");
+        InsertPlan coldPlan = state.mode().planInsert(RouteTarget.COLD);
 
         append(routed.hot(), options);
         Dataset<Row> cold = routed.cold();
+        if (coldPlan.toHeap()) {
+            append(cold, options);
+        }
+        coldPlan.cold().ifPresent(sink -> {
+            switch (sink) {
+                case LAKE -> LakeMergeJob.upserts(cold, state, options);
+                case DELTA -> deltaUpsert(cold, state, options);
+            }
+        });
+    }
+
+    private static void deltaUpsert(Dataset<Row> cold, SeamState state, SeamOptions options) {
         Dataset<Row> encoded = cold.select(
-                PkColumns.expression(state.primaryKeyCols(), cold).as("pk"),
-                TierKeyColumns.canonical(cold.col(state.tierKeyCol()),
-                        state.tierKeyType()).as("tier_key"),
+                PkColumns.expression(state.table().primaryKeyCols(), cold).as("pk"),
+                TierKeyColumns.canonical(cold.col(state.table().tierKeyCol()),
+                        state.table().tierKeyType()).as("tier_key"),
                 functions.to_json(functions.struct(functions.col("*"))).as("payload"));
         encoded.foreachPartition(new DeltaUpsert(
-                options.jdbcUrl(), options.jdbcProperties(), state.tableId()));
+                options.jdbcUrl(), options.jdbcProperties(), state.table().tableId()));
     }
 
     private static void append(Dataset<Row> rows, SeamOptions options) {

@@ -2,10 +2,14 @@ package io.tierdb.trino;
 
 import io.tierdb.common.RowBatchData.Column;
 import io.tierdb.connector.ConnectorConfig;
-import io.tierdb.connector.source.HeapCatalog;
+import io.tierdb.connector.read.Cold;
+import io.tierdb.connector.read.Read;
 import io.tierdb.connector.seam.SeamClient;
 import io.tierdb.connector.seam.SeamOptions;
 import io.tierdb.connector.seam.SeamState;
+import io.tierdb.connector.source.HeapCatalog;
+import io.tierdb.lake.access.LakeAccess;
+import io.tierdb.lake.access.LakeScan;
 import io.trino.spi.TrinoException;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ColumnMetadata;
@@ -79,18 +83,51 @@ public class TierDBMetadata implements ConnectorMetadata {
         if (state.pinId() != null) {
             connector.registerPin(session.getQueryId(), options, state.pinId());
         }
-        boolean heapComplete = state.heapIsComplete();
-        if (!heapComplete && state.snapshotId() != null
-                && !"iceberg".equals(state.lakeFormat())) {
-            throw new TrinoException(NOT_SUPPORTED, "the tierdb connector cannot read lake format '"
-                    + state.lakeFormat() + "' yet (supported: iceberg)");
-        }
+        Read read = resolveRead(state);
+        boolean heapComplete = read instanceof Read.Heap;
+        LakeScan scan = coldScan(read);
+        boolean mergeDelta = read instanceof Read.Seam s && s.cold() instanceof Cold.Merge;
+        Map<String, String> lakeConfig = scan == null ? null
+                : state.lake().accessConfig(connector.config().fileIoProperties());
         return new TierDBTableHandle(tableName.getSchemaName(), tableName.getTableName(),
-                state.tableId(), state.primaryKeyCols(), state.tierKeyCol(), state.tierKeyType(),
+                state.table().tableId(), state.table().primaryKeyCols(),
+                state.table().tierKeyCol(), state.table().tierKeyType(),
                 state.readSeam(), heapComplete,
-                heapComplete ? null : state.snapshotId(),
-                heapComplete ? null : state.metadataLocation(),
+                state.lake().format(), lakeConfig,
+                scan == null ? null : scan.props(),
+                mergeDelta,
                 TupleDomain.all());
+    }
+
+    private Read resolveRead(SeamState state) {
+        boolean hybrid = state.cutLine().hybridSeam() != null;
+        if (!hybrid && !state.mode().isDirect() && state.cutLine().lakeProps().isEmpty()) {
+            return state.mode().heapComplete() ? new Read.Heap()
+                    : new Read.Seam(state.readSeam(), new Cold.Delta());
+        }
+        LakeAccess access;
+        try {
+            access = state.lake().openAccess(connector.config().fileIoProperties());
+        } catch (IllegalStateException e) {
+            throw new TrinoException(NOT_SUPPORTED,
+                    "the tierdb connector cannot read lake format '"
+                            + state.lake().format() + "': " + e.getMessage(), e);
+        }
+        return hybrid ? state.scanHybrid(access) : state.scan(access);
+    }
+
+    private static LakeScan coldScan(Read read) {
+        if (!(read instanceof Read.Seam seam)) {
+            return null;
+        }
+        Cold cold = seam.cold();
+        if (cold instanceof Cold.Live live) {
+            return live.scan();
+        }
+        if (cold instanceof Cold.Merge merge) {
+            return merge.scan();
+        }
+        return null;
     }
 
     @Override

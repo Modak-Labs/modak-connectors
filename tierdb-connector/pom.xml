@@ -21,6 +21,18 @@
             <groupId>io.tierdb</groupId>
             <artifactId>tierdb-common</artifactId>
         </dependency>
+        <!-- Format-agnostic lake access ports; the seam layer never sees a
+             concrete format. -->
+        <dependency>
+            <groupId>io.tierdb</groupId>
+            <artifactId>tierdb-lake</artifactId>
+        </dependency>
+        <!-- The Iceberg adapter, discovered via ServiceLoader at runtime. -->
+        <dependency>
+            <groupId>io.tierdb</groupId>
+            <artifactId>tierdb-iceberg</artifactId>
+            <scope>runtime</scope>
+        </dependency>
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
@@ -29,6 +41,12 @@
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
+            <version>2.14.2</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-core</artifactId>
             <version>2.14.2</version>
             <scope>provided</scope>
         </dependency>

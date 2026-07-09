@@ -19,6 +19,22 @@
         <dependency>
             <groupId>io.tierdb</groupId>
             <artifactId>tierdb-connector</artifactId>
+            <!-- The Spark Iceberg runtime bundle supplies iceberg + hadoop; take
+                 only the tierdb classes from the transitive tierdb-iceberg. -->
+            <exclusions>
+                <exclusion>
+                    <groupId>org.apache.iceberg</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.hadoop</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.parquet</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         <dependency>
             <groupId>io.tierdb</groupId>
@@ -59,17 +75,6 @@
             <groupId>io.tierdb</groupId>
             <artifactId>tierdb-tiering</artifactId>
             <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>io.tierdb</groupId>
-            <artifactId>tierdb-iceberg</artifactId>
-            <scope>test</scope>
-            <exclusions>
-                <exclusion>
-                    <groupId>org.apache.hadoop</groupId>
-                    <artifactId>*</artifactId>
-                </exclusion>
-            </exclusions>
         </dependency>
         <dependency>
             <groupId>io.zonky.test</groupId>

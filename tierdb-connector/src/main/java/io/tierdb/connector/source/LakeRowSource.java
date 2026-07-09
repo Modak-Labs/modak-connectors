@@ -2,83 +2,70 @@ package io.tierdb.connector.source;
 
 import io.tierdb.common.PkCodec;
 import io.tierdb.common.RowBatchData.Column;
-import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.nio.ByteBuffer;
-import java.time.LocalDateTime;
-import java.time.ZoneOffset;
+import io.tierdb.lake.access.ColumnConstraint;
+import io.tierdb.lake.access.LakeAccess;
+import io.tierdb.lake.access.LakeScan;
+import io.tierdb.lake.access.RowScan;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
-import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
-import org.apache.iceberg.BaseTable;
-import org.apache.iceberg.StaticTableOperations;
-import org.apache.iceberg.Table;
-import org.apache.iceberg.data.IcebergGenerics;
-import org.apache.iceberg.data.Record;
-import org.apache.iceberg.expressions.Expression;
-import org.apache.iceberg.io.CloseableIterable;
-import org.apache.iceberg.io.FileIO;
 
+/**
+ * Format-blind cold rows for a resolved scan: reads through the format's
+ * {@link LakeAccess} port and, when the scan is pinned, drops rows whose PK
+ * is overridden in the {@code tierdb.delta} overlay.
+ */
 public final class LakeRowSource implements Iterator<Object[]>, AutoCloseable {
 
-    private final List<Column> columns;
-    private final List<String> primaryKeyCols;
+    private final int width;
+    private final int[] pkIndexes;
     private final Set<String> deltaPks;
-    private final FileIO fileIo;
-    private final CloseableIterable<Record> iterable;
-    private final Iterator<Record> records;
+    private final RowScan rows;
     private Object[] next;
 
-    private LakeRowSource(List<Column> columns, List<String> primaryKeyCols, Set<String> deltaPks,
-            FileIO fileIo, CloseableIterable<Record> iterable) {
-        this.columns = columns;
-        this.primaryKeyCols = primaryKeyCols;
+    private LakeRowSource(int width, int[] pkIndexes, Set<String> deltaPks, RowScan rows) {
+        this.width = width;
+        this.pkIndexes = pkIndexes;
         this.deltaPks = deltaPks;
-        this.fileIo = fileIo;
-        this.iterable = iterable;
-        this.records = iterable.iterator();
+        this.rows = rows;
     }
 
     public static LakeRowSource open(String jdbcUrl, Properties jdbcProperties, long tableId,
-            String metadataLocation, long snapshotId, String displayName, List<Column> columns,
-            List<String> primaryKeyCols, Map<String, String> fileIoProperties,
-            Optional<Expression> filter) {
-        Set<String> deltaPks = DeltaClient.pks(jdbcUrl, jdbcProperties, tableId);
-        FileIO fileIo = LakeTables.fileIo(fileIoProperties);
-        Table table = new BaseTable(
-                new StaticTableOperations(metadataLocation, fileIo), displayName);
+            LakeAccess access, LakeScan scan, boolean mergeDelta, List<Column> columns,
+            List<String> primaryKeyCols, Map<Column, ColumnConstraint> filter) {
+        Set<String> deltaPks = mergeDelta
+                ? DeltaClient.pks(jdbcUrl, jdbcProperties, tableId)
+                : Set.of();
 
-        Set<String> selected = new LinkedHashSet<>();
+        LinkedHashSet<String> selected = new LinkedHashSet<>();
         columns.forEach(c -> selected.add(c.name()));
         selected.addAll(primaryKeyCols);
+        List<String> selectedList = List.copyOf(selected);
 
-        IcebergGenerics.ScanBuilder scan = IcebergGenerics.read(table)
-                .useSnapshot(snapshotId)
-                .select(selected.toArray(String[]::new));
-        if (filter.isPresent()) {
-            scan = scan.where(filter.get());
+        int[] pkIndexes = new int[primaryKeyCols.size()];
+        for (int i = 0; i < primaryKeyCols.size(); i++) {
+            pkIndexes[i] = selectedList.indexOf(primaryKeyCols.get(i));
         }
-        return new LakeRowSource(columns, primaryKeyCols, deltaPks, fileIo, scan.build());
+
+        return new LakeRowSource(columns.size(), pkIndexes, deltaPks,
+                access.rows(scan, selectedList, filter));
     }
 
     @Override
     public boolean hasNext() {
-        while (next == null && records.hasNext()) {
-            Record record = records.next();
-            if (deltaPks.contains(pkOf(record))) {
+        while (next == null && rows.hasNext()) {
+            Object[] row = rows.next();
+            if (!deltaPks.isEmpty() && deltaPks.contains(pkOf(row))) {
                 continue;
             }
-            Object[] row = new Object[columns.size()];
-            for (int i = 0; i < columns.size(); i++) {
-                row[i] = normalize(record.getField(columns.get(i).name()));
-            }
-            next = row;
+            // Requested columns lead the selection; trim off the PK-only tail.
+            next = row.length == width ? row : Arrays.copyOf(row, width);
         }
         return next != null;
     }
@@ -95,35 +82,17 @@ public final class LakeRowSource implements Iterator<Object[]>, AutoCloseable {
 
     @Override
     public void close() {
-        try {
-            iterable.close();
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        } finally {
-            fileIo.close();
-        }
+        rows.close();
     }
 
-    private String pkOf(Record record) {
-        if (primaryKeyCols.size() == 1) {
-            return String.valueOf(record.getField(primaryKeyCols.get(0)));
+    private String pkOf(Object[] row) {
+        if (pkIndexes.length == 1) {
+            return String.valueOf(row[pkIndexes[0]]);
         }
-        List<String> parts = new ArrayList<>(primaryKeyCols.size());
-        for (String col : primaryKeyCols) {
-            parts.add(String.valueOf(record.getField(col)));
+        List<String> parts = new ArrayList<>(pkIndexes.length);
+        for (int index : pkIndexes) {
+            parts.add(String.valueOf(row[index]));
         }
         return PkCodec.encode(parts);
-    }
-
-    private static Object normalize(Object value) {
-        if (value instanceof LocalDateTime ldt) {
-            return ldt.atOffset(ZoneOffset.UTC);
-        }
-        if (value instanceof ByteBuffer buf) {
-            byte[] bytes = new byte[buf.remaining()];
-            buf.duplicate().get(bytes);
-            return bytes;
-        }
-        return value;
     }
 }
